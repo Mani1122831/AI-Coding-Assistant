@@ -1,0 +1,49 @@
+"""
+models/__init__.py
+Models package for AI Coding Assistant.
+"""
+from models.schemas import (
+    CodeGenerationRequest,
+    CodeGenerationResponse,
+    DebugRequest,
+    DebugResponse,
+    ExplainRequest,
+    ExplainResponse,
+    RefactorRequest,
+    RefactorResponse,
+    ConvertRequest,
+    ConvertResponse,
+    TestGenerationRequest,
+    TestGenerationResponse,
+    SecurityRequest,
+    SecurityResponse,
+    SecurityFinding,
+    ChatMessage,
+    ChatRequest,
+    ChatResponse,
+    SeverityLevel,
+    AIError,
+)
+
+__all__ = [
+    "CodeGenerationRequest",
+    "CodeGenerationResponse",
+    "DebugRequest",
+    "DebugResponse",
+    "ExplainRequest",
+    "ExplainResponse",
+    "RefactorRequest",
+    "RefactorResponse",
+    "ConvertRequest",
+    "ConvertResponse",
+    "TestGenerationRequest",
+    "TestGenerationResponse",
+    "SecurityRequest",
+    "SecurityResponse",
+    "SecurityFinding",
+    "ChatMessage",
+    "ChatRequest",
+    "ChatResponse",
+    "SeverityLevel",
+    "AIError",
+]
