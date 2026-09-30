@@ -1,15 +1,8 @@
 """
 app.py
-AI Coding Assistant — Streamlit application entry point.
-
-This file handles:
-- Page configuration and custom CSS
-- Sidebar navigation
-- Routing to feature pages
-- High-level session state management and live API status check
-
-Business logic lives in services/.
-Prompt engineering lives in prompts/.
+AI Coding Assistant — Streamlit application entry point with secure authentication,
+MongoDB Atlas persistence, user profile, coding history, activity audit logging,
+and multi-feature AI coding tools powered by Google Gemini.
 """
 from __future__ import annotations
 
@@ -24,6 +17,8 @@ st.set_page_config(
 )
 
 # ── Imports (after page config) ────────────────────────────────────────────────
+from typing import Any, Dict, Optional
+
 from config.settings import settings
 from models.schemas import (
     ChatMessage,
@@ -32,18 +27,26 @@ from models.schemas import (
     ConvertRequest,
     DebugRequest,
     ExplainRequest,
+    PasswordChange,
+    PasswordResetConfirm,
+    PasswordResetRequest,
     RefactorRequest,
     SecurityRequest,
     TestGenerationRequest,
+    User,
+    UserLogin,
+    UserProfileUpdate,
+    UserRegistration,
 )
-from services.file_service import FileService
-from services.llm_service import LLMService, RECOMMENDED_MODELS
+from services.activity_service import activity_service
+from services.auth_service import auth_service
 from services.code_service import CodeService
+from services.file_service import FileService
+from services.history_service import history_service
+from services.llm_service import LLMService, RECOMMENDED_MODELS
+from services.mongo_service import mongo_service
 from services.security_service import SecurityService
-from utils.helpers import (
-    build_language_list,
-    format_file_size,
-)
+from utils.helpers import build_language_list, format_file_size
 
 # ── Custom CSS ─────────────────────────────────────────────────────────────────
 
@@ -51,7 +54,7 @@ def _inject_css() -> None:
     st.markdown(
         """
         <style>
-        /* ── Base ── */
+        /* ── Base Theme ── */
         .stApp { background-color: #0e1117; }
 
         /* ── Sidebar ── */
@@ -71,9 +74,6 @@ def _inject_css() -> None:
             border-radius: 8px;
         }
 
-        /* ── Info / success / error boxes ── */
-        .st-emotion-cache-1kyxreq { border-radius: 8px; }
-
         /* ── Buttons ── */
         .stButton > button {
             border-radius: 6px;
@@ -82,14 +82,14 @@ def _inject_css() -> None:
         }
         .stButton > button:hover { opacity: 0.85; }
 
-        /* ── Severity badges ── */
+        /* ── Severity Badges ── */
         .badge-critical { background:#da3633; color:#fff; padding:2px 8px; border-radius:4px; font-weight:700; font-size:0.8rem; }
         .badge-high     { background:#e3b341; color:#000; padding:2px 8px; border-radius:4px; font-weight:700; font-size:0.8rem; }
         .badge-medium   { background:#d29922; color:#000; padding:2px 8px; border-radius:4px; font-weight:700; font-size:0.8rem; }
         .badge-low      { background:#388bfd; color:#fff; padding:2px 8px; border-radius:4px; font-weight:700; font-size:0.8rem; }
         .badge-info     { background:#3d444d; color:#e6edf3; padding:2px 8px; border-radius:4px; font-weight:700; font-size:0.8rem; }
 
-        /* ── Section headers ── */
+        /* ── Section Headers ── */
         .feature-header {
             border-bottom: 2px solid #21262d;
             padding-bottom: 0.5rem;
@@ -97,9 +97,29 @@ def _inject_css() -> None:
             color: #e6edf3;
         }
 
-        /* ── Chat messages ── */
+        /* ── User & Assistant Chat ── */
         .chat-user { background:#1c2128; border-left:3px solid #58a6ff; padding:0.75rem 1rem; border-radius:4px; margin-bottom:0.5rem; }
         .chat-assistant { background:#161b22; border-left:3px solid #3fb950; padding:0.75rem 1rem; border-radius:4px; margin-bottom:0.5rem; }
+
+        /* ── History Card ── */
+        .history-card {
+            background-color: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        /* ── Auth Card ── */
+        .auth-container {
+            max-width: 480px;
+            margin: 2rem auto;
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 12px;
+            padding: 2rem;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+        }
 
         /* ── Empty state ── */
         .empty-state { text-align:center; padding:3rem; color:#8b949e; }
@@ -109,13 +129,20 @@ def _inject_css() -> None:
     )
 
 
-# ── Session state helpers ──────────────────────────────────────────────────────
+# ── Session State Management ───────────────────────────────────────────────────
 
 def _init_session() -> None:
-    """Initialise all required session state keys."""
+    """Initialise all session state variables and detect password reset URL tokens."""
     defaults = {
+        "authenticated": False,
+        "user": None,  # Dict with id, full_name, username, email
+        "auth_view": "LOGIN",  # Routing states: "LOGIN", "REGISTER", "FORGOT_PASSWORD", "RESET_PASSWORD"
+        "login_prefill_identifier": "",
+        "auth_flash_success": "",
+        "auth_flash_error": "",
+        "reset_token_input": "",
         "page": "Dashboard",
-        "chat_history": [],   # List[ChatMessage]
+        "chat_history": [],  # List[ChatMessage]
         "chat_context_code": "",
         "chat_context_language": "",
         "file_content": "",
@@ -124,10 +151,32 @@ def _init_session() -> None:
         "session_api_key": "",
         "session_model": settings.active_model,
         "api_status_cached": None,
+        "db_status_cached": None,
+        "viewing_history_record": None,
+        "dev_reset_token": "",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+    # Detect reset_token from URL query parameters (e.g. ?reset_token=xyz)
+    try:
+        url_token = st.query_params.get("reset_token")
+        if url_token and not st.session_state.get("authenticated", False):
+            st.session_state["auth_view"] = "RESET_PASSWORD"
+            st.session_state["reset_token_input"] = str(url_token).strip()
+            # Clean URL query parameter so token is not exposed in the browser address bar
+            st.query_params.clear()
+    except Exception:
+        pass
+
+
+
+def _get_current_user_id() -> str:
+    """Return logged-in user's string ID, or empty string."""
+    if st.session_state.user and isinstance(st.session_state.user, dict):
+        return str(st.session_state.user.get("id", ""))
+    return ""
 
 
 def _get_active_api_key() -> str:
@@ -141,10 +190,7 @@ def _get_active_model() -> str:
 
 
 def _get_api_status(force_check: bool = False) -> tuple[str, str]:
-    """
-    Check API status and cache the result in session state.
-    Returns: (status_code, display_text)
-    """
+    """Check API configuration and connectivity."""
     if st.session_state.api_status_cached is not None and not force_check:
         return st.session_state.api_status_cached
 
@@ -160,21 +206,18 @@ def _get_api_status(force_check: bool = False) -> tuple[str, str]:
     return status
 
 
-def _get_llm() -> LLMService | None:
-    """Return an initialized LLMService, or None if key is missing."""
-    api_key = _get_active_api_key()
-    model = _get_active_model()
-    if not api_key:
-        return None
-    try:
-        return LLMService(api_key=api_key, model=model)
-    except Exception as exc:
-        st.error(f"Failed to initialise AI service: {exc}")
-        return None
+def _get_db_status(force_check: bool = False) -> tuple[bool, str]:
+    """Check MongoDB Atlas connectivity."""
+    if st.session_state.db_status_cached is not None and not force_check:
+        return st.session_state.db_status_cached
+
+    status = mongo_service.test_connection()
+    st.session_state.db_status_cached = status
+    return status
 
 
 def _require_llm() -> LLMService | None:
-    """Show appropriate warning and return None if LLM is not ready."""
+    """Validate LLM readiness and return LLMService instance or None."""
     api_key = _get_active_api_key()
     if not api_key:
         st.warning(
@@ -193,69 +236,399 @@ def _require_llm() -> LLMService | None:
         st.error(f"**Model Error:** {status_msg}. Please select a valid GEMINI_MODEL in Settings.")
         return None
 
-    llm = _get_llm()
-    return llm
+    try:
+        return LLMService(api_key=api_key, model=_get_active_model())
+    except Exception as exc:
+        st.error(f"Failed to initialize AI service: {exc}")
+        return None
 
 
-# ── Pages ──────────────────────────────────────────────────────────────────────
+def _record_ai_action(
+    operation: str,
+    language: str,
+    summary: str,
+    input_code: Optional[str] = None,
+    generated_code: Optional[str] = None,
+    explanation: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Save history record and audit log for authenticated user."""
+    user_id = _get_current_user_id()
+    if not user_id:
+        return
+
+    record_id, secret_detected = history_service.save_history(
+        user_id=user_id,
+        operation=operation,
+        language=language,
+        input_summary=summary,
+        input_code=input_code,
+        generated_code=generated_code,
+        explanation=explanation,
+        metadata=metadata,
+    )
+
+    activity_service.log_activity(
+        user_id=user_id,
+        action=f"{operation.replace('_', ' ').title()} used",
+        details={"language": language, "has_code": bool(generated_code)},
+    )
+
+    if secret_detected:
+        st.info("ℹ️ **Security Notice:** Potential credential/token detected in input was redacted before saving to your history.")
+
+
+# ── Authentication Screens (Login & Register) ──────────────────────────────────
+
+def _render_auth_login() -> None:
+    st.markdown("#### Welcome Back")
+    prefill = st.session_state.get("login_prefill_identifier", "")
+    with st.form("login_form"):
+        identifier = st.text_input(
+            "Email or Username",
+            value=prefill,
+            placeholder="e.g. alex@example.com or alex",
+        )
+        password = st.text_input("Password", type="password", placeholder="••••••••")
+        submitted = st.form_submit_button("Log In", use_container_width=True, type="primary")
+
+    if submitted:
+        if not identifier or not password:
+            st.error("Please enter both email/username and password.")
+        else:
+            with st.spinner("Authenticating..."):
+                success, message, user = auth_service.login_user(
+                    UserLogin(email_or_username=identifier, password=password)
+                )
+            if success and user:
+                st.session_state.authenticated = True
+                st.session_state.user = {
+                    "id": user.id,
+                    "full_name": user.full_name,
+                    "username": user.username,
+                    "email": user.email,
+                    "created_at": user.created_at,
+                }
+                # Clear prefill and transient state
+                st.session_state.login_prefill_identifier = ""
+                st.session_state.auth_flash_success = ""
+                st.session_state.auth_flash_error = ""
+                st.session_state.page = "Dashboard"
+                activity_service.log_activity(user.id, "User logged in")
+                st.rerun()
+            else:
+                st.error(message)
+                if "network access" in message.lower() or "ip address" in message.lower():
+                    st.info(
+                        "💡 **Atlas Network Access Fix:**\n"
+                        "1. Open [MongoDB Atlas Console](https://cloud.mongodb.com)\n"
+                        "2. Navigate to **Security** → **Network Access**\n"
+                        "3. Click **Add IP Address**\n"
+                        "4. Add `0.0.0.0/0` (Allow Access from Anywhere) or your current public IP\n"
+                        "5. Click **Confirm** and wait 1–2 minutes for the changes to apply.",
+                        icon="ℹ️",
+                    )
+
+    # Forgot password action link
+    if st.button("Forgot Password?", key="btn_nav_forgot_pwd", use_container_width=True):
+        st.session_state.auth_view = "FORGOT_PASSWORD"
+        st.rerun()
+
+
+
+def _render_auth_register() -> None:
+    st.markdown("#### Create Your Workspace Account")
+    with st.form("register_form"):
+        full_name = st.text_input("Full Name", placeholder="e.g. Alex Johnson")
+        username = st.text_input("Username", placeholder="e.g. alex_dev (3-30 chars)")
+        email = st.text_input("Email Address", placeholder="alex@example.com")
+        reg_password = st.text_input("Password", type="password", placeholder="••••••••")
+        confirm_password = st.text_input("Confirm Password", type="password", placeholder="••••••••")
+
+        st.caption(
+            "🔒 **Password Requirements:**\n"
+            "- Minimum 8 characters\n"
+            "- At least one uppercase (A-Z) & lowercase (a-z) letter\n"
+            "- At least one number (0-9) & special character (!@#$%...)"
+        )
+        reg_submitted = st.form_submit_button("Create Account", use_container_width=True, type="primary")
+
+    if reg_submitted:
+        req = UserRegistration(
+            full_name=full_name,
+            username=username,
+            email=email,
+            password=reg_password,
+            confirm_password=confirm_password,
+        )
+        with st.spinner("Creating account..."):
+            success, message, user = auth_service.register_user(req)
+
+        if success and user:
+            activity_service.log_activity(user.id, "User registered")
+            # Clear authentication / session state
+            st.session_state.authenticated = False
+            st.session_state.user = None
+            # Pre-fill email/username for the Login page
+            st.session_state.login_prefill_identifier = username or email
+            # Set flash success message
+            st.session_state.auth_flash_success = (
+                "Account created successfully. Please log in with your new account."
+            )
+            # Switch view to Login
+            st.session_state.auth_view = "LOGIN"
+            st.rerun()
+        else:
+            # Keep user on the registration page with specific safe error
+            st.error(message)
+            if "network access" in message.lower() or "ip address" in message.lower():
+                st.info(
+                    "💡 **Atlas Network Access Fix:**\n"
+                    "1. Open [MongoDB Atlas Console](https://cloud.mongodb.com)\n"
+                    "2. Navigate to **Security** → **Network Access**\n"
+                    "3. Click **Add IP Address**\n"
+                    "4. Add `0.0.0.0/0` (Allow Access from Anywhere) or your current public IP\n"
+                    "5. Click **Confirm** and wait 1–2 minutes for the changes to apply.",
+                    icon="ℹ️",
+                )
+
+
+
+def _render_auth_forgot_password() -> None:
+    st.markdown("#### 🔐 Forgot Password?")
+    st.markdown(
+        "Enter your registered email address below. If an account exists, a secure single-use "
+        "password reset link will be sent to your inbox."
+    )
+
+    with st.form("forgot_password_form"):
+        fp_email = st.text_input("Registered Email Address", placeholder="e.g. alex@example.com")
+        fp_submitted = st.form_submit_button("Send Reset Link", use_container_width=True, type="primary")
+
+    if fp_submitted:
+        if not fp_email or "@" not in fp_email:
+            st.error("Please enter a valid email address.")
+        else:
+            with st.spinner("Processing request..."):
+                success, message, dev_info = auth_service.request_password_reset(fp_email)
+            if success:
+                st.success(f"✅ {message}")
+                st.session_state.pop("dev_reset_token", None)
+            elif not auth_service.is_smtp_configured or "not configured" in message.lower():
+                st.warning(f"⚠️ {message}")
+                if dev_info and settings.is_development and dev_info.get("dev_token"):
+                    st.session_state["dev_reset_token"] = dev_info["dev_token"]
+                else:
+                    st.session_state.pop("dev_reset_token", None)
+            else:
+                st.error(f"❌ {message}")
+                st.session_state.pop("dev_reset_token", None)
+
+    # Safe development reset flow (ENVIRONMENT=development only, NO raw token or URL displayed)
+    if settings.is_development and st.session_state.get("dev_reset_token"):
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.info(
+            "🛠️ **DEVELOPMENT ONLY**\n\n"
+            "SMTP is not configured. Use the development reset action below to test password reset."
+        )
+        if st.button("Open Development Reset Flow", key="btn_open_dev_reset_flow", type="primary", use_container_width=True):
+            st.session_state.auth_view = "RESET_PASSWORD"
+            st.session_state.reset_token_input = st.session_state.pop("dev_reset_token", "")
+            st.rerun()
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    if st.button("← Back to Login", key="btn_fp_back_to_login", use_container_width=True):
+        st.session_state.pop("dev_reset_token", None)
+        st.session_state.auth_view = "LOGIN"
+        st.rerun()
+
+
+def _render_auth_reset_password() -> None:
+    st.markdown("#### 🔑 Reset Your Password")
+    st.markdown(
+        "Enter your secure reset token (automatically populated if you clicked an email link) "
+        "and choose a new password."
+    )
+
+    preset_token = st.session_state.get("reset_token_input", "")
+
+    with st.form("reset_password_form"):
+        token_input = st.text_input(
+            "Reset Token",
+            value=preset_token,
+            type="password",
+            help="The secure reset token provided in your reset email or URL link.",
+        )
+        new_password = st.text_input("New Password", type="password", placeholder="••••••••")
+        confirm_new_password = st.text_input("Confirm New Password", type="password", placeholder="••••••••")
+
+        st.caption(
+            "🔒 **Password Requirements:**\n"
+            "- Minimum 8 characters\n"
+            "- At least one uppercase (A-Z) & lowercase (a-z) letter\n"
+            "- At least one number (0-9) & special character (!@#$%...)"
+        )
+        reset_submitted = st.form_submit_button("Reset Password", use_container_width=True, type="primary")
+
+    if reset_submitted:
+        if not token_input or not token_input.strip():
+            st.error("Please provide the reset token.")
+        elif not new_password or not confirm_new_password:
+            st.error("Please enter and confirm your new password.")
+        else:
+            with st.spinner("Validating token and updating password..."):
+                success, message = auth_service.reset_password(
+                    token=token_input,
+                    new_password=new_password,
+                    confirm_new_password=confirm_new_password,
+                )
+
+            if success:
+                # Clear URL query parameters and reset token input
+                try:
+                    st.query_params.clear()
+                except Exception:
+                    pass
+                st.session_state.reset_token_input = ""
+                st.session_state.auth_view = "LOGIN"
+                st.session_state.auth_flash_success = (
+                    "Password reset successfully. Please log in with your new password."
+                )
+                st.rerun()
+            else:
+                st.error(f"❌ {message}")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    if st.button("← Back to Login", key="btn_rp_back_to_login", use_container_width=True):
+        st.session_state.auth_view = "LOGIN"
+        st.rerun()
+
+
+def render_auth_screen() -> None:
+    """Display centered authentication screen for unauthenticated visitors."""
+    st.markdown("<br>", unsafe_allow_html=True)
+    col1, col2, col3 = st.columns([1, 2, 1])
+
+    with col2:
+        st.markdown(
+            """
+            <div style="text-align: center; margin-bottom: 1.5rem;">
+                <h1 style="color: #58a6ff; font-size: 2.2rem; margin-bottom: 0.2rem;">🤖 AI Coding Assistant</h1>
+                <p style="color: #8b949e; font-size: 1.05rem;">Your intelligent development workspace</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        db_ok, db_msg = _get_db_status()
+        if not db_ok:
+            st.warning(f"⚠️ **Database Status:** {db_msg}", icon="⚠️")
+
+        # Display flash success / error messages if present
+        if st.session_state.get("auth_flash_success"):
+            st.success(f"✅ {st.session_state.auth_flash_success}")
+            st.session_state.auth_flash_success = ""
+
+        if st.session_state.get("auth_flash_error"):
+            st.error(f"❌ {st.session_state.auth_flash_error}")
+            st.session_state.auth_flash_error = ""
+
+        current_view = st.session_state.get("auth_view", "LOGIN")
+
+        # Top switcher between Login and Register if on standard views
+        if current_view in ("LOGIN", "REGISTER"):
+            col_t1, col_t2 = st.columns(2)
+            with col_t1:
+                t1_type = "primary" if current_view == "LOGIN" else "secondary"
+                if st.button("🔑 Login", key="tab_nav_login", use_container_width=True, type=t1_type):
+                    st.session_state.auth_view = "LOGIN"
+                    st.rerun()
+            with col_t2:
+                t2_type = "primary" if current_view == "REGISTER" else "secondary"
+                if st.button("📄 Create Account", key="tab_nav_register", use_container_width=True, type=t2_type):
+                    st.session_state.auth_view = "REGISTER"
+                    st.rerun()
+            st.markdown("---")
+
+        if current_view == "LOGIN":
+            _render_auth_login()
+        elif current_view == "REGISTER":
+            _render_auth_register()
+        elif current_view == "FORGOT_PASSWORD":
+            _render_auth_forgot_password()
+        elif current_view == "RESET_PASSWORD":
+            _render_auth_reset_password()
+        else:
+            _render_auth_login()
+
+
+
+# ── Feature Pages ──────────────────────────────────────────────────────────────
 
 def page_dashboard() -> None:
     st.markdown('<h1 class="feature-header">🏠 Dashboard</h1>', unsafe_allow_html=True)
 
+    user = st.session_state.user or {}
+    user_name = user.get("full_name") or user.get("username") or "Developer"
+    user_id = _get_current_user_id()
+
+    st.markdown(f"### 👋 Welcome back, **{user_name}**!")
+
     status_code, status_text = _get_api_status()
+    db_connected, db_msg = _get_db_status()
     active_model = _get_active_model()
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("AI Provider", settings.ai_provider.upper())
     with col2:
-        st.metric("Model", active_model)
+        st.metric("Gemini Model", active_model)
     with col3:
         st.metric("API Status", status_text)
+    with col4:
+        st.metric("MongoDB", "✅ Connected" if db_connected else "❌ Disconnected")
 
     st.markdown("---")
-    st.markdown("### 🚀 Quick Start")
 
-    if status_code == "NOT_CONFIGURED":
-        st.info(
-            "**Get started in 2 steps:**\n\n"
-            "1. Set `GEMINI_API_KEY` in your `.env` file (or enter it in **Settings**)\n"
-            "2. Get your free API key at [Google AI Studio](https://aistudio.google.com/app/apikey)\n\n"
-            "Then select any feature from the sidebar to begin.",
-            icon="ℹ️",
-        )
-    elif status_code == "AUTH_FAILED":
-        st.error(
-            "⚠️ **API Key Authentication Failed.** "
-            "Please verify that your `GEMINI_API_KEY` is correct in `.env` or in **Settings**.",
-            icon="⚠️",
-        )
-    elif status_code == "MODEL_ERROR":
-        st.warning(
-            f"⚠️ **Model Configuration Issue.** Model `{active_model}` could not be resolved. "
-            "Please select a recommended model (e.g. `gemini-flash-latest`) in **Settings**.",
-            icon="⚠️",
-        )
-    else:
-        st.success(f"AI service is connected and ready using `{active_model}`.", icon="✅")
+    col_act, col_quick = st.columns([1.4, 1])
 
-    st.markdown("---")
-    st.markdown("### ✨ Features")
-    features = [
-        ("✨ Generate Code", "Describe what you want — get production-ready code"),
-        ("🐛 Debug Code", "Paste buggy code + error message → get the fix"),
-        ("📖 Explain Code", "Understand any code snippet in plain English"),
-        ("🔧 Refactor Code", "Improve code quality without changing behavior"),
-        ("🔄 Convert Code", "Translate code between programming languages"),
-        ("🧪 Generate Tests", "Auto-generate pytest, unittest, or Jest tests"),
-        ("🔐 Security Analysis", "Scan code for vulnerabilities and get fixes"),
-        ("📁 Analyze File", "Upload source files for AI-powered analysis"),
-        ("💬 AI Coding Chat", "Chat with AI about your code in context"),
-    ]
-    cols = st.columns(3)
-    for i, (name, desc) in enumerate(features):
-        with cols[i % 3]:
-            st.markdown(f"**{name}**\n\n{desc}")
+    with col_act:
+        st.markdown("### 🕒 Recent Coding Activity")
+        recent_history = history_service.get_user_history(user_id=user_id, limit=5)
+        if not recent_history:
+            st.info("No coding history recorded yet. Use any tool below to generate, debug, or convert code!", icon="ℹ️")
+        else:
+            for item in recent_history:
+                with st.container():
+                    op_title = item.operation.replace("_", " ").title()
+                    st.markdown(
+                        f"""
+                        <div class="history-card">
+                            <div style="display:flex; justify-content:space-between; align-items:center;">
+                                <strong>⚡ {op_title} ({item.language})</strong>
+                                <small style="color:#8b949e;">{item.created_at[:16].replace('T', ' ')}</small>
+                            </div>
+                            <p style="margin-top:0.4rem; margin-bottom:0.4rem; color:#c9d1d9; font-size:0.92rem;">
+                                {item.input_summary[:140]}{'...' if len(item.input_summary) > 140 else ''}
+                            </p>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+    with col_quick:
+        st.markdown("### 🚀 Quick Launch")
+        quick_tools = [
+            ("✨ Generate Code", "Generate Code", "Build functions or full modules from scratch"),
+            ("🐛 Debug Code", "Debug Code", "Locate root causes and obtain verified bugfixes"),
+            ("🔄 Convert Code", "Convert Code", "Translate code cleanly across programming languages"),
+            ("🔐 Security Analysis", "Security Analysis", "Inspect source code for security risks"),
+            ("💬 AI Coding Chat", "AI Coding Chat", "Ask questions and iterate with your code in context"),
+        ]
+        for label, page_name, desc in quick_tools:
+            if st.button(f"{label}", key=f"quick_{page_name}", use_container_width=True):
+                st.session_state.page = page_name
+                st.rerun()
 
 
 def page_generate() -> None:
@@ -306,6 +679,16 @@ def page_generate() -> None:
             return
 
         st.success("Code generated successfully!", icon="✅")
+
+        _record_ai_action(
+            operation="generate",
+            language=language,
+            summary=requirements[:200],
+            input_code=None,
+            generated_code=result.generated_code,
+            explanation=result.explanation,
+            metadata={"framework": framework, "constraints": constraints},
+        )
 
         tab1, tab2, tab3 = st.tabs(["📄 Code", "📋 Details", "🔧 How to Run"])
 
@@ -387,6 +770,16 @@ def page_debug() -> None:
 
         st.success("Debug analysis complete!", icon="✅")
 
+        _record_ai_action(
+            operation="debug",
+            language=language,
+            summary=f"Debug {language} code: {error_message or 'Logic bug'}"[:200],
+            input_code=code,
+            generated_code=result.corrected_code,
+            explanation=f"Problem: {result.problem_explanation}\n\nRoot Cause: {result.root_cause}",
+            metadata={"error_message": error_message, "expected": expected},
+        )
+
         tab1, tab2, tab3 = st.tabs(["🔍 Analysis", "✅ Fixed Code", "💡 Prevention"])
 
         with tab1:
@@ -435,6 +828,16 @@ def page_explain() -> None:
             return
 
         st.success("Explanation ready!", icon="📖")
+
+        _record_ai_action(
+            operation="explain",
+            language=language,
+            summary=f"Explain: {result.summary[:150]}",
+            input_code=code,
+            generated_code=None,
+            explanation=result.summary,
+            metadata={"complexity": result.complexity},
+        )
 
         tab1, tab2, tab3 = st.tabs(["📋 Summary", "🔍 Detailed", "🎓 Beginner"])
 
@@ -504,6 +907,16 @@ def page_refactor() -> None:
 
         st.success("Refactoring complete!", icon="✅")
 
+        _record_ai_action(
+            operation="refactor",
+            language=language,
+            summary=f"Refactor {language} code (Focus: {focus or 'general'})"[:200],
+            input_code=code,
+            generated_code=result.refactored_code,
+            explanation=result.explanation_of_changes,
+            metadata={"issues_count": len(result.issues_found)},
+        )
+
         tab1, tab2 = st.tabs(["⚠️ Issues Found", "✅ Refactored Code"])
 
         with tab1:
@@ -570,6 +983,16 @@ print(result)""",
 
         st.success(f"Converted {source_lang} → {target_lang} successfully!", icon="✅")
 
+        _record_ai_action(
+            operation="convert",
+            language=f"{source_lang} -> {target_lang}",
+            summary=f"Convert {source_lang} to {target_lang}"[:200],
+            input_code=code,
+            generated_code=result.converted_code,
+            explanation=result.behavior_notes,
+            metadata={"source_language": source_lang, "target_language": target_lang},
+        )
+
         tab1, tab2 = st.tabs(["📄 Converted Code", "📋 Notes & Differences"])
 
         with tab1:
@@ -626,6 +1049,16 @@ def page_tests() -> None:
 
         st.success("Tests generated!", icon="✅")
 
+        _record_ai_action(
+            operation="tests",
+            language=language,
+            summary=f"Generate {framework} unit tests for {language}"[:200],
+            input_code=code,
+            generated_code=result.test_code,
+            explanation=None,
+            metadata={"framework": framework, "cases_count": len(result.test_cases_covered)},
+        )
+
         tab1, tab2 = st.tabs(["🧪 Test Code", "📋 Coverage"])
 
         with tab1:
@@ -678,7 +1111,6 @@ def page_security() -> None:
             st.error(f"**{result.error.code}:** {result.error.message}")
             return
 
-        # Overall risk badge
         risk = result.overall_risk.value
         risk_colors = {
             "CRITICAL": "🔴",
@@ -689,6 +1121,16 @@ def page_security() -> None:
         }
         icon = risk_colors.get(risk, "⚪")
         st.markdown(f"### Overall Risk: {icon} **{risk}**")
+
+        _record_ai_action(
+            operation="security",
+            language=language,
+            summary=f"Security scan ({language}): Risk {risk}, {len(result.findings)} findings"[:200],
+            input_code=code,
+            generated_code=None,
+            explanation=result.summary,
+            metadata={"overall_risk": risk, "findings_count": len(result.findings)},
+        )
 
         if result.summary:
             st.markdown(result.summary)
@@ -753,6 +1195,10 @@ def page_file_analyze() -> None:
             horizontal=True,
         )
 
+        file_debug_err = None
+        if action == "🐛 Debug":
+            file_debug_err = st.text_input("Error message (optional):", key="file_debug_err_input")
+
         llm = _require_llm()
         if not llm:
             return
@@ -772,15 +1218,12 @@ def page_file_analyze() -> None:
                     st.markdown(r.summary)
                     st.markdown("#### Detailed Explanation")
                     st.markdown(r.line_by_line)
-                    if r.beginner_explanation:
-                        with st.expander("🎓 Beginner Explanation"):
-                            st.markdown(r.beginner_explanation)
+                    _record_ai_action("explain_file", language, f"Explain file {result.filename}", code, None, r.summary)
 
             elif action == "🐛 Debug":
-                err_msg = st.text_input("Error message (optional):", key="file_debug_err")
                 from services.code_service import CodeService as CS
                 with st.spinner("Debugging..."):
-                    r = CS(llm).debug(DebugRequest(language=language, code=code, error_message=err_msg or None))
+                    r = CS(llm).debug(DebugRequest(language=language, code=code, error_message=file_debug_err or None))
                 if r.error:
                     st.error(r.error.message)
                 else:
@@ -788,6 +1231,7 @@ def page_file_analyze() -> None:
                     st.markdown(r.problem_explanation)
                     st.markdown("#### Fixed Code")
                     st.code(r.corrected_code, language=language.lower())
+                    _record_ai_action("debug_file", language, f"Debug file {result.filename}", code, r.corrected_code, r.root_cause)
 
             elif action == "🔧 Refactor":
                 from services.code_service import CodeService as CS
@@ -798,8 +1242,7 @@ def page_file_analyze() -> None:
                 else:
                     st.markdown("#### Refactored Code")
                     st.code(r.refactored_code, language=language.lower())
-                    st.markdown("#### Changes")
-                    st.markdown(r.explanation_of_changes)
+                    _record_ai_action("refactor_file", language, f"Refactor file {result.filename}", code, r.refactored_code, r.explanation_of_changes)
 
             elif action == "🔐 Security Analysis":
                 with st.spinner("Running security analysis..."):
@@ -810,6 +1253,7 @@ def page_file_analyze() -> None:
                     st.markdown(f"**Overall Risk:** {r.overall_risk.value}")
                     for f in r.findings:
                         st.warning(f"**[{f.severity.value}] {f.title}:** {f.description}")
+                    _record_ai_action("security_file", language, f"Security scan file {result.filename}", code, None, r.summary)
 
             elif action == "🧪 Generate Tests":
                 from services.code_service import CodeService as CS
@@ -819,6 +1263,7 @@ def page_file_analyze() -> None:
                     st.error(r.error.message)
                 else:
                     st.code(r.test_code, language=language.lower())
+                    _record_ai_action("tests_file", language, f"Generate tests for file {result.filename}", code, r.test_code, None)
 
         if st.button("💬 Chat about this file"):
             st.session_state.chat_context_code = result.content
@@ -921,7 +1366,183 @@ def page_chat() -> None:
         else:
             history.append(ChatMessage(role="assistant", content=response.reply))
             st.session_state.chat_history = history
+            _record_ai_action(
+                operation="chat",
+                language=ctx_lang or "General",
+                summary=user_input.strip()[:150],
+                input_code=ctx_code,
+                generated_code=response.reply,
+            )
             st.rerun()
+
+
+# ── History & Profile Pages ───────────────────────────────────────────────────
+
+def page_history() -> None:
+    st.markdown('<h1 class="feature-header">📚 Coding History</h1>', unsafe_allow_html=True)
+    st.caption("View, search, reopen, or manage your saved AI coding generations and fixes.")
+
+    user_id = _get_current_user_id()
+    if not user_id:
+        st.error("User session not found.")
+        return
+
+    # Filter & Search bar
+    col1, col2, col3 = st.columns([2, 1.2, 1])
+    with col1:
+        search_query = st.text_input("🔍 Search History:", placeholder="Search by prompt, keyword, or code snippet...")
+    with col2:
+        op_options = ["All", "generate", "debug", "explain", "refactor", "convert", "tests", "security", "chat"]
+        selected_op = st.selectbox("Filter Operation:", op_options)
+    with col3:
+        st.write("")
+        st.write("")
+        if st.button("🗑 Clear All History", use_container_width=True):
+            deleted = history_service.clear_user_history(user_id)
+            activity_service.log_activity(user_id, "Cleared all coding history")
+            st.success(f"Cleared {deleted} history records.")
+            st.rerun()
+
+    # Query history
+    records = history_service.get_user_history(
+        user_id=user_id,
+        limit=50,
+        operation=selected_op if selected_op != "All" else None,
+        search_query=search_query or None,
+    )
+
+    if not records:
+        st.markdown(
+            '<div class="empty-state">📭 No coding history found matching your filters.</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    st.markdown(f"**Showing {len(records)} history records:**")
+
+    for rec in records:
+        with st.container():
+            op_label = rec.operation.replace("_", " ").title()
+            date_str = rec.created_at[:19].replace("T", " ")
+
+            col_a, col_b = st.columns([4, 1])
+            with col_a:
+                st.markdown(f"#### ⚡ {op_label} — `{rec.language}` <small style='color:#8b949e;'>({date_str})</small>", unsafe_allow_html=True)
+                st.markdown(f"**Summary:** {rec.input_summary}")
+            with col_b:
+                if st.button("🗑 Delete", key=f"del_{rec.id}", use_container_width=True):
+                    history_service.delete_history_item(user_id, rec.id)
+                    activity_service.log_activity(user_id, "Deleted history item", {"record_id": rec.id})
+                    st.success("Record deleted.")
+                    st.rerun()
+
+            with st.expander("👁️ View Full Code & Output"):
+                if rec.input_code:
+                    st.markdown("##### Input Code:")
+                    st.code(rec.input_code, language=rec.language.lower().split(" ")[0])
+
+                if rec.generated_code:
+                    st.markdown("##### AI Output / Generated Code:")
+                    st.code(rec.generated_code, language=rec.language.lower().split(" ")[0])
+
+                if rec.explanation:
+                    st.markdown("##### Explanation / Notes:")
+                    st.markdown(rec.explanation)
+
+                if st.button("💬 Load into Chat Context", key=f"chat_load_{rec.id}"):
+                    st.session_state.chat_context_code = rec.generated_code or rec.input_code or ""
+                    st.session_state.chat_context_language = rec.language
+                    st.session_state.page = "AI Coding Chat"
+                    st.rerun()
+
+            st.markdown("---")
+
+
+def page_profile() -> None:
+    st.markdown('<h1 class="feature-header">👤 User Profile</h1>', unsafe_allow_html=True)
+
+    user_id = _get_current_user_id()
+    if not user_id:
+        st.error("User session not found.")
+        return
+
+    user_doc = auth_service.get_user_by_id(user_id)
+    if not user_doc:
+        sess_user = st.session_state.user or {}
+        if sess_user and isinstance(sess_user, dict):
+            user_doc = User(
+                id=user_id,
+                full_name=sess_user.get("full_name", ""),
+                username=sess_user.get("username", ""),
+                email=sess_user.get("email", ""),
+                created_at=str(sess_user.get("created_at", "")),
+            )
+            st.warning("⚠️ Database connection is unavailable. Displaying cached session profile.", icon="⚠️")
+        else:
+            st.error("Could not load user profile from database.")
+            return
+
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        st.markdown("### 📋 Account Information")
+        st.markdown(f"**Full Name:** {user_doc.full_name}")
+        st.markdown(f"**Username:** `@{user_doc.username}`")
+        st.markdown(f"**Email:** `{user_doc.email}`")
+        created_display = user_doc.created_at[:10] if user_doc.created_at else "Recently"
+        st.markdown(f"**Account Created:** {created_display}")
+
+        st.markdown("---")
+        st.markdown("### ✏️ Edit Profile")
+        with st.form("edit_profile_form"):
+            new_name = st.text_input("Full Name", value=user_doc.full_name)
+            new_username = st.text_input("Username", value=user_doc.username)
+            save_profile = st.form_submit_button("Save Profile Changes", use_container_width=True)
+
+        if save_profile:
+            success, msg, updated_u = auth_service.update_profile(
+                user_id, UserProfileUpdate(full_name=new_name, username=new_username)
+            )
+            if success and updated_u:
+                if isinstance(st.session_state.user, dict):
+                    st.session_state.user["full_name"] = updated_u.full_name
+                    st.session_state.user["username"] = updated_u.username
+                activity_service.log_activity(user_id, "Profile updated")
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+
+    with col2:
+        st.markdown("### 🔒 Change Password")
+        with st.form("change_pwd_form"):
+            curr_pwd = st.text_input("Current Password", type="password")
+            new_pwd = st.text_input("New Password", type="password")
+            confirm_new_pwd = st.text_input("Confirm New Password", type="password")
+            change_submitted = st.form_submit_button("Update Password", use_container_width=True)
+
+        if change_submitted:
+            req = PasswordChange(
+                current_password=curr_pwd,
+                new_password=new_pwd,
+                confirm_new_password=confirm_new_pwd,
+            )
+            success, msg = auth_service.change_password(user_id, req)
+            if success:
+                activity_service.log_activity(user_id, "Password changed")
+                st.success(msg)
+            else:
+                st.error(msg)
+
+        st.markdown("---")
+        st.markdown("### 🕒 Recent Activity Audit")
+        activities = activity_service.get_recent_activities(user_id, limit=6)
+        if not activities:
+            st.info("No activity logs yet.")
+        else:
+            for act in activities:
+                t_str = act.timestamp[:19].replace("T", " ")
+                st.markdown(f"- **{act.action}** <small style='color:#8b949e;'>({t_str})</small>", unsafe_allow_html=True)
 
 
 def page_settings() -> None:
@@ -930,17 +1551,20 @@ def page_settings() -> None:
     active_key = _get_active_api_key()
     active_model = _get_active_model()
     status_code, status_msg = _get_api_status()
+    db_connected, db_msg = _get_db_status()
 
-    st.markdown("### 🔌 AI Provider & Model Configuration")
+    st.markdown("### 🔌 System Diagnostics & Status")
 
     col1, col2 = st.columns(2)
     with col1:
         st.metric("AI Provider", settings.ai_provider.upper())
         st.metric("Active Model", active_model)
-    with col2:
         st.metric("API Status", status_msg)
+    with col2:
+        st.metric("Database", settings.mongodb_database)
+        st.metric("MongoDB Connection", "✅ Connected" if db_connected else "❌ Disconnected")
         key_source = "Session Override" if st.session_state.get("session_api_key") else (".env file" if settings.is_configured() else "Not set")
-        st.metric("Key Source", key_source)
+        st.metric("API Key Source", key_source)
 
     st.markdown("---")
     st.markdown("### 🛠️ Interactive Configuration")
@@ -955,7 +1579,31 @@ def page_settings() -> None:
         st.session_state.api_status_cached = None
         st.rerun()
 
-    # Optional runtime API key configuration
+    # Diagnostic buttons
+    col_t1, col_t2 = st.columns(2)
+    with col_t1:
+        if st.button("🔄 Test Live Gemini API Connection", use_container_width=True):
+            with st.spinner("Testing API connection..."):
+                code, msg = _get_api_status(force_check=True)
+                if code == "CONFIGURED":
+                    st.success(f"Connection Successful: {msg} using `{active_model}`", icon="✅")
+                elif code == "NOT_CONFIGURED":
+                    st.warning("API key is not configured.", icon="⚠️")
+                elif code == "AUTH_FAILED":
+                    st.error("Authentication failed. Check your API key.", icon="❌")
+                else:
+                    st.error(f"Configuration issue: {msg}", icon="⚠️")
+
+    with col_t2:
+        if st.button("🔄 Test MongoDB Atlas Connection", use_container_width=True):
+            with st.spinner("Testing database connection..."):
+                ok, msg = _get_db_status(force_check=True)
+                if ok:
+                    st.success(msg, icon="✅")
+                else:
+                    st.error(msg, icon="❌")
+
+    # Session API key override
     with st.expander("🔑 Override API Key in Current Session", expanded=not bool(active_key)):
         st.caption("Provide an API key for the current browser session. It is never stored on disk or logged.")
         temp_key = st.text_input(
@@ -977,45 +1625,37 @@ def page_settings() -> None:
                 st.session_state.api_status_cached = None
                 st.rerun()
 
-    # Test Connection button
-    if st.button("🔄 Test Live API Connection", use_container_width=True, type="primary"):
-        with st.spinner("Testing connection to Gemini API..."):
-            code, msg = _get_api_status(force_check=True)
-            if code == "CONFIGURED":
-                st.success(f"Connection Successful: {msg} using `{active_model}`", icon="✅")
-            elif code == "NOT_CONFIGURED":
-                st.warning("API key is not configured.", icon="⚠️")
-            elif code == "AUTH_FAILED":
-                st.error("Authentication failed. Check your API key.", icon="❌")
-            else:
-                st.error(f"Configuration issue: {msg}", icon="⚠️")
-
     st.markdown("---")
-    st.markdown("### 📄 Persistent Configuration via `.env`")
-    st.markdown(
-        "To configure the API key permanently without entering it every time, set it in your `.env` file:"
-    )
+    st.markdown("### 📄 Persistent Environment Setup (`.env`)")
     st.code(
         f"""# .env
+# AI Configuration
 AI_PROVIDER=gemini
 GEMINI_MODEL={active_model}
-GEMINI_API_KEY=your_actual_api_key_here
+GEMINI_API_KEY=your_gemini_api_key_here
+
+# MongoDB Atlas Persistence
+MONGODB_URI=your_mongodb_atlas_connection_string
+MONGODB_DATABASE=ai_coding_assistant
+
+# File Upload Settings
 MAX_FILE_SIZE_MB=2
 LOG_LEVEL=INFO""",
         language="bash",
     )
 
-    st.info(
-        "Get your free Gemini API key at [Google AI Studio](https://aistudio.google.com/app/apikey)",
-        icon="🔑",
-    )
 
-
-# ── Sidebar navigation ─────────────────────────────────────────────────────────
+# ── Sidebar Navigation (Protected) ─────────────────────────────────────────────
 
 def render_sidebar() -> str:
+    """Render sidebar for logged-in users."""
     with st.sidebar:
         st.markdown("# 🤖 AI Coding\nAssistant")
+
+        # Current user badge
+        user = st.session_state.user or {}
+        display_name = user.get("full_name") or user.get("username") or "User"
+        st.markdown(f"**Logged in as:**\n👤 **{display_name}** (`@{user.get('username', '')}`)")
         st.markdown("---")
 
         pages = {
@@ -1029,6 +1669,8 @@ def render_sidebar() -> str:
             "🔐 Security Analysis": "Security Analysis",
             "📁 Analyze File": "Analyze File",
             "💬 AI Coding Chat": "AI Coding Chat",
+            "📚 Coding History": "Coding History",
+            "👤 Profile": "Profile",
             "⚙️ Settings": "Settings",
         }
 
@@ -1041,7 +1683,7 @@ def render_sidebar() -> str:
                 st.rerun()
 
         st.markdown("---")
-        # Live status indicator
+        # Live status badges
         status_code, status_text = _get_api_status()
         active_model = _get_active_model()
         if status_code == "CONFIGURED":
@@ -1053,10 +1695,27 @@ def render_sidebar() -> str:
         else:
             st.error("❌ Key Missing")
 
+        # Logout button
+        st.markdown("---")
+        if st.button("🚪 Log Out", use_container_width=True):
+            user_id = _get_current_user_id()
+            if user_id:
+                activity_service.log_activity(user_id, "User logged out")
+            st.session_state.authenticated = False
+            st.session_state.user = None
+            st.session_state.chat_history = []
+            st.session_state.chat_context_code = ""
+            st.session_state.page = "Dashboard"
+            st.session_state.auth_view = "LOGIN"
+            st.session_state.login_prefill_identifier = ""
+            st.session_state.auth_flash_success = ""
+            st.session_state.auth_flash_error = ""
+            st.rerun()
+
     return st.session_state.get("page", "Dashboard")
 
 
-# ── Router ─────────────────────────────────────────────────────────────────────
+# ── Page Router ────────────────────────────────────────────────────────────────
 
 PAGE_MAP = {
     "Dashboard": page_dashboard,
@@ -1069,15 +1728,24 @@ PAGE_MAP = {
     "Security Analysis": page_security,
     "Analyze File": page_file_analyze,
     "AI Coding Chat": page_chat,
+    "Coding History": page_history,
+    "Profile": page_profile,
     "Settings": page_settings,
 }
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Application Main Entry Point ───────────────────────────────────────────────
 
 def main() -> None:
     _inject_css()
     _init_session()
+
+    # 1. Guard: If not authenticated, force Login/Register view
+    if not st.session_state.authenticated:
+        render_auth_screen()
+        return
+
+    # 2. Render authenticated sidebar and route to selected protected page
     current_page = render_sidebar()
     page_fn = PAGE_MAP.get(current_page, page_dashboard)
     page_fn()

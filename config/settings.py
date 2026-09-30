@@ -18,8 +18,8 @@ load_dotenv(_PROJECT_ROOT / ".env", override=True)
 
 class Settings(BaseSettings):
     """
-    Application configuration with support for Gemini API and models.
-    Supports GEMINI_API_KEY and GEMINI_MODEL (with AI_MODEL / API_KEY fallbacks).
+    Application configuration with support for Gemini API, MongoDB persistence, and models.
+    Supports GEMINI_API_KEY, GEMINI_MODEL, and MONGODB_URI.
     """
 
     # AI provider selection
@@ -50,6 +50,82 @@ class Settings(BaseSettings):
         default=None,
         alias="api_key",
         description="Generic API key fallback if GEMINI_API_KEY is not specified",
+    )
+
+    # ── MongoDB Settings ────────────────────────────────────────────────────────
+    mongodb_uri: str = Field(
+        default="",
+        description="MongoDB Atlas connection URI. Set via MONGODB_URI env var.",
+    )
+
+    mongodb_database: str = Field(
+        default="ai_coding_assistant",
+        description="MongoDB Database name.",
+    )
+
+    mongodb_users_collection: str = Field(
+        default="users",
+        description="MongoDB collection for user accounts.",
+    )
+
+    mongodb_history_collection: str = Field(
+        default="coding_history",
+        description="MongoDB collection for coding history records.",
+    )
+
+    mongodb_activity_collection: str = Field(
+        default="activity_logs",
+        description="MongoDB collection for user activity logs.",
+    )
+
+    # ── Environment & App Base URL ──────────────────────────────────────────────
+    environment: Literal["development", "production", "testing"] = Field(
+        default="development",
+        description="Deployment environment (development, production, testing)",
+    )
+
+    app_base_url: str = Field(
+        default="http://localhost:8501",
+        description="Base URL for password reset links and callbacks",
+    )
+
+    # ── Password Reset Settings ────────────────────────────────────────────────
+    password_reset_token_expiry_minutes: int = Field(
+        default=30,
+        ge=5,
+        le=1440,
+        description="Password reset token expiration time in minutes",
+    )
+
+    # ── SMTP Email Settings ────────────────────────────────────────────────────
+    smtp_host: str = Field(
+        default="",
+        description="SMTP server host (e.g. smtp.gmail.com)",
+    )
+
+    smtp_port: int = Field(
+        default=587,
+        description="SMTP server port (e.g. 587 for STARTTLS, 465 for SSL)",
+    )
+
+    smtp_username: str = Field(
+        default="",
+        description="SMTP username or email address",
+    )
+
+    smtp_password: str = Field(
+        default="",
+        description="SMTP password or app password",
+    )
+
+    smtp_from_email: str = Field(
+        default="",
+        description="Sender email address for notifications",
+    )
+
+    smtp_use_tls: bool = Field(
+        default=True,
+        description="Enable STARTTLS for SMTP connections",
     )
 
     # File upload settings
@@ -90,6 +166,14 @@ class Settings(BaseSettings):
             return "gemini-flash-latest"
         return str(env_val).strip().strip("\"'")
 
+    @field_validator("mongodb_uri", mode="before")
+    @classmethod
+    def extract_mongo_uri(cls, v: Optional[str]) -> str:
+        """Extract and clean the MongoDB URI."""
+        if v is None:
+            v = os.environ.get("MONGODB_URI") or ""
+        return str(v).strip().strip("\"'")
+
     @property
     def api_key(self) -> str:
         """Active API key for the configured provider."""
@@ -109,6 +193,20 @@ class Settings(BaseSettings):
     def is_configured(self) -> bool:
         """Return True if a non-empty API key is configured."""
         return bool(self.api_key)
+
+    def is_mongo_configured(self) -> bool:
+        """Return True if a non-empty MongoDB URI is configured."""
+        return bool(self.mongodb_uri)
+
+    @property
+    def is_smtp_configured(self) -> bool:
+        """Return True if SMTP host and port are configured."""
+        return bool(self.smtp_host and self.smtp_host.strip())
+
+    @property
+    def is_development(self) -> bool:
+        """Return True if running in development mode."""
+        return self.environment.lower() == "development"
 
 
 # Singleton instance used throughout the application

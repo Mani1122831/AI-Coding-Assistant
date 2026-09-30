@@ -1,14 +1,15 @@
 """
 models/schemas.py
-Pydantic models for all request and response data structures.
-These models ensure type safety and clear API contracts between layers.
+Pydantic models for all request and response data structures,
+including AI coding tasks, user authentication, coding history, and activity logs.
 """
 from __future__ import annotations
 
+from datetime import datetime
 from enum import Enum
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 
 
 # ── Enumerations ──────────────────────────────────────────────────────────────
@@ -105,6 +106,10 @@ class RefactorIssue(BaseModel):
     issue: str
     reason: str
     severity: str = "MEDIUM"  # LOW, MEDIUM, HIGH
+
+
+# Keep backward-compatible alias
+RefactorFinding = RefactorIssue
 
 
 class RefactorRequest(BaseModel):
@@ -216,3 +221,84 @@ class ChatResponse(BaseModel):
     """Structured output from the chat feature."""
     reply: str
     error: Optional[AIError] = None
+
+
+# ── Authentication & User Models ──────────────────────────────────────────────
+
+
+class User(BaseModel):
+    """Database representation of a user account."""
+    id: str = Field(..., description="Unique user ID string representation of ObjectId")
+    full_name: str
+    username: str
+    email: str
+    created_at: str
+    updated_at: str
+    is_active: bool = True
+
+
+class UserRegistration(BaseModel):
+    """Payload for registering a new user."""
+    full_name: str
+    username: str
+    email: str
+    password: str
+    confirm_password: str
+
+
+class UserLogin(BaseModel):
+    """Payload for user login."""
+    email_or_username: str
+    password: str
+
+
+class UserProfileUpdate(BaseModel):
+    """Payload for updating user profile info."""
+    full_name: str
+    username: str
+
+
+class PasswordChange(BaseModel):
+    """Payload for changing user password from profile."""
+    current_password: str
+    new_password: str
+    confirm_new_password: str
+
+
+class PasswordResetRequest(BaseModel):
+    """Payload for requesting a password reset email."""
+    email: str
+
+
+class PasswordResetConfirm(BaseModel):
+    """Payload for resetting password with a validated token."""
+    token: str
+    new_password: str
+    confirm_new_password: str
+
+
+
+# ── History & Activity Models ─────────────────────────────────────────────────
+
+
+class HistoryRecord(BaseModel):
+    """Database representation of a user's coding history item."""
+    id: str
+    user_id: str
+    operation: str  # generate, debug, explain, refactor, convert, tests, security, chat, file_analyze
+    language: str = "Unknown"
+    input_summary: str = ""
+    input_code: Optional[str] = None
+    generated_code: Optional[str] = None
+    explanation: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+
+
+class ActivityLog(BaseModel):
+    """Database representation of an audit/activity log entry."""
+    id: str
+    user_id: str
+    action: str
+    timestamp: str
+    details: Optional[Dict[str, Any]] = None
