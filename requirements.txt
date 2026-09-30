@@ -28,3 +28,17 @@ email-validator>=2.1.0
 # Testing
 pytest>=8.0.0
 pytest-mock>=3.12.0
+
+
+streamlit
+google-genai
+python-dotenv
+pydantic
+pydantic-settings
+httpx
+requests
+pymongo
+bcrypt
+pytest
+pytest-mock
+pygments
